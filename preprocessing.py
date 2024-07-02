@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 from fusion import fusion
 import argparse
+from typing import Optional, Callable
 
 
 _IMAGE_FILES = [
@@ -15,6 +16,24 @@ _IMAGE_FILES = [
     # "oakd_right",
     # "oakd_rgb",
 ]
+
+TQDM = tqdm
+
+
+class TQDMList:
+    def __init__(self, data: list, prefix: Optional[str], callback: Callable):
+        self.data = data
+        self.callback = callback
+        if prefix is None:
+            self.prefix = ""
+        else:
+            self.prefix = prefix
+
+    def __iter__(self):
+        for idx, item in enumerate(self.data):
+            yield item
+            self.callback(f"{self.prefix}{idx}/{len(self.data)}", idx / len(self.data))
+        self.callback(f"{self.prefix}{len(self.data)}/{len(self.data)}", 1)
 
 
 def parse_args():
@@ -29,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--dest_folder",
         type=str,
-        default="/images_origin/",
+        default="images_origin",
         help="The destination folder for the processed images",
     )
     parser.add_argument(
@@ -54,6 +73,9 @@ def parse_args():
     return parser.parse_args()
 
 
+import subprocess
+
+
 class Preprocessing:
     class HyperParamter:
         FOLDER = "lab0624"
@@ -61,9 +83,70 @@ class Preprocessing:
         RGB_NIR_FUSION_ENABLED = False
         USE_MASK = False
         IMAGE_FILES = _IMAGE_FILES
+        hdr_fusion = False
 
-    def __init__(self, hyperparameter: HyperParamter):
-        self.parameter = hyperparameter
+    def __init__(
+        self, hyperparameter: Optional[HyperParamter], tqdm: Optional[Callable] = None
+    ):
+        if hyperparameter is not None:
+            self.parameter = hyperparameter
+        else:
+            self.parameter = Preprocessing.HyperParamter()
+            global TQDM
+            TQDM = lambda x, desc=None: TQDMList(x, desc, tqdm)
+
+    def load_gzip(self, file_path: str):
+        space_id = file_path.split("/")[-1].split(".")[0]
+        dest_folder = os.path.join("data", space_id)
+        os.makedirs(dest_folder, exist_ok=True)
+        subprocess.run(
+            ["tar", "-xvf", file_path, "-C", dest_folder], stdout=subprocess.PIPE
+        )
+        space_folder = dest_folder
+        if "tmp" in os.listdir(space_folder):
+            space_folder = os.path.join(space_folder, "tmp")
+        if "oakd_capture" in os.listdir(space_folder):
+            space_folder = os.path.join(space_folder, "oakd_capture")
+            space_folder = os.path.join(space_folder, os.listdir(space_folder)[0])
+        for capture_folder in os.listdir(space_folder):
+            capture_folder = os.path.join(space_folder, capture_folder)
+            subprocess.run(["mv", capture_folder, dest_folder], stdout=subprocess.PIPE)
+        self.parameter.FOLDER = dest_folder
+
+        return dest_folder
+
+    def examine_folder(self):
+        key_found: dict[str, int] = {}
+        capture_cnt = 0
+        scene_cnt = 0
+        for capture_folders in TQDM(os.listdir(self.parameter.FOLDER)):
+            if not capture_folders.isdigit():
+                continue
+            if not os.path.isdir(os.path.join(self.parameter.FOLDER, capture_folders)):
+                continue
+            capture_cnt += 1
+            for scene_folder in os.listdir(
+                os.path.join(self.parameter.FOLDER, capture_folders)
+            ):
+                if not scene_folder.isdigit() or not os.path.isdir(
+                    os.path.join(self.parameter.FOLDER, capture_folders, scene_folder)
+                ):
+                    continue
+                scene_cnt += 1
+                for image in os.listdir(
+                    os.path.join(self.parameter.FOLDER, capture_folders, scene_folder)
+                ):
+                    if not image.endswith(".png"):
+                        continue
+                    key = image.split(".png")[0]
+                    if key not in key_found:
+                        key_found[key] = 0
+                    key_found[key] += 1
+        return {
+            "capture_cnt": capture_cnt,
+            "scene_cnt": scene_cnt,
+            "key_found": key_found,
+        }
 
     def rgb_nir_fusion(
         rgb_image: cv2.typing.MatLike,
@@ -119,6 +202,8 @@ class Preprocessing:
             x.split(image_file_name + "_")[1].split(".png")[0] for x in image_path_list
         ]
         exposure_times = [int(x) for x in exposure_times if x.isdigit()]
+        if len(exposure_times) < 4:
+            return
         exposure_times.sort()
         image_path_list = [
             image_file_name + "_" + str(x) + ".png" for x in exposure_times
@@ -134,9 +219,6 @@ class Preprocessing:
             )
             for x in image_path_list
         ]
-
-        print("Exposure times:", exposure_times, exposure_times.dtype)
-
         images = [
             cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             for x in images
@@ -155,70 +237,96 @@ class Preprocessing:
 
         mertge_mertges = cv2.createMergeMertens()
         fusion = mertge_mertges.process(images)
-        cv2.imwrite(image_file_path.replace(".png", "_sdr.png"), ldr * 255)
-        cv2.imwrite(image_file_path.replace(".png", "_hdr.hdr"), hdr)
-        cv2.imwrite(image_file_path.replace(".png", "_fusion.png"), fusion * 255)
+        image_file_path = image_file_path.replace(".png", "")
+        cv2.imwrite(image_file_path + "_sdr.png", ldr * 255)
+        cv2.imwrite(image_file_path + "_hdr.hdr", hdr)
+        cv2.imwrite(image_file_path + "_fusion.png", fusion * 255)
+
+    def hdr_fusion_scene(self, scene_folder: str):
+        images = os.listdir(scene_folder)
+        image_prefix = set()
+        for image in images:
+            if not image.endswith(".png"):
+                continue
+            image = image.split(".png")[0]
+            exposure_time = image.split("_")[-1]
+            image = image.replace(f"_{exposure_time}", "")
+            if not exposure_time.isdigit():
+                continue
+            if int(exposure_time) < 100:
+                continue
+            image_prefix.add(image)
+
+        for image in image_prefix:
+            self.hdr_fusion(os.path.join(scene_folder, image))
+
+    def listdir_space_scene(self, folder: str):
+        scene_folder_list: list[str] = []
+        for capture_folders in os.listdir(folder):
+            if not capture_folders.isdigit():
+                continue
+            if not os.path.isdir(os.path.join(folder, capture_folders)):
+                continue
+            for scene_folders in os.listdir(os.path.join(folder, capture_folders)):
+                if not scene_folders.isdigit():
+                    continue
+                if not os.path.isdir(
+                    os.path.join(folder, capture_folders, scene_folders)
+                ):
+                    continue
+                scene_folder_list.append(
+                    os.path.join(folder, capture_folders, scene_folders)
+                )
+        return scene_folder_list
+
+    def hdr_fusion_space(self):
+        config = self.parameter
+        for scene_folders in TQDM(
+            self.listdir_space_scene(config.FOLDER), desc="HDR fusion "
+        ):
+
+            self.hdr_fusion_scene(scene_folders)
 
     def group_images(
         self,
     ):
+        if self.parameter.USE_MASK:
+            mask = cv2.imread(os.path.join(self.parameter.FOLDER, "mask_enhanced.png"))
         config = self.parameter
-        mask = cv2.imread(
-            os.path.join(config.FOLDER, "mask_enhanced.png"), cv2.IMREAD_GRAYSCALE
-        )
-        for capture_folders in tqdm(os.listdir(config.FOLDER)):
-            if not capture_folders.isdigit():
-                continue
-            if not os.path.isdir(os.path.join(config.FOLDER, capture_folders)):
-                continue
-            for scene_folders in tqdm(
-                os.listdir(os.path.join(config.FOLDER, capture_folders))
-            ):
-                if not scene_folders.isdigit():
+        for scene_folders in TQDM(
+            self.listdir_space_scene(config.FOLDER), desc="Group images"
+        ):
+            for image in os.listdir(scene_folders):
+                if not any(x in image for x in config.IMAGE_FILES):
                     continue
-                for image in os.listdir(
-                    os.path.join(config.FOLDER, capture_folders, scene_folders)
-                ):
-                    if not any(x in image for x in config.IMAGE_FILES):
-                        continue
-                    if not image.endswith(".png"):
-                        continue
+                if not image.endswith(".png"):
+                    continue
 
-                    if args.hdr_fusion:
-                        self.hdr_fusion(
-                            f"{config.FOLDER}/{capture_folders}/{scene_folders}/{image}"
-                        )
-                        continue
+                # Create the destination folder if it doesn't exist
+                image_group = [x for x in config.IMAGE_FILES if x in image][0]
+                destination_folder = os.path.join(
+                    config.FOLDER,
+                    config.DEST_FOLDER,
+                    image_group,
+                )
+                os.makedirs(destination_folder, exist_ok=True)
 
-                    # Create the destination folder if it doesn't exist
+                # Copy the image file to the destination folder
+                image_path = os.path.join(scene_folders, image)
 
-                    destination_folder = os.path.join(
-                        config.FOLDER,
-                        config.DEST_FOLDER,
-                        image.split("_channel_")[0],
-                    )
-                    os.makedirs(destination_folder, exist_ok=True)
+                image_name = f'{scene_folders.replace("/","__")}_{image}'
+                destination_path = os.path.join(destination_folder, image_name)
+                image = cv2.imread(image_path)
 
-                    # Copy the image file to the destination folder
-                    image_path = os.path.join(
-                        config.FOLDER, capture_folders, scene_folders, image
+                if config.RGB_NIR_FUSION_ENABLED and "channel_0" in image_name:
+                    image_nir = cv2.imread(image_path.replace("channel_0", "channel_1"))
+                    image = self.rgb_nir_fusion(
+                        image, image_nir, mask if config.USE_MASK else None
                     )
 
-                    image_name = f"{capture_folders}_{scene_folders}_{image}"
-                    destination_path = os.path.join(destination_folder, image_name)
-                    image = cv2.imread(image_path)
-
-                    if config.RGB_NIR_FUSION_ENABLED and "channel_0" in image_name:
-                        image_nir = cv2.imread(
-                            image_path.replace("channel_0", "channel_1")
-                        )
-                        image = self.rgb_nir_fusion(
-                            image, image_nir, mask if config.USE_MASK else None
-                        )
-
-                    if image.dtype == np.uint16:
-                        image = (image / 256).astype(np.uint8)
-                    cv2.imwrite(destination_path, image)
+                if image.dtype == np.uint16:
+                    image = (image / 256).astype(np.uint8)
+                cv2.imwrite(destination_path, image)
 
 
 if __name__ == "__main__":
@@ -229,6 +337,10 @@ if __name__ == "__main__":
     config.RGB_NIR_FUSION_ENABLED = args.rgb_nir_fusion
     config.USE_MASK = args.use_mask
     config.IMAGE_FILES = args.image_files.split(",")
+    config.hdr_fusion = args.hdr_fusion
     preprocessing = Preprocessing(config)
 
-    preprocessing.group_images()
+    if config.hdr_fusion:
+        preprocessing.hdr_fusion_space()
+    else:
+        preprocessing.group_images()
