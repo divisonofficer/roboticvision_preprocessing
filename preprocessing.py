@@ -94,6 +94,7 @@ class Preprocessing:
             self.parameter = Preprocessing.HyperParamter()
             global TQDM
             TQDM = lambda x, desc=None: TQDMList(x, desc, tqdm)
+            self.tqdm_callback = tqdm
 
     def load_gzip(self, file_path: str):
         space_id = file_path.split("/")[-1].split(".")[0]
@@ -136,7 +137,7 @@ class Preprocessing:
                 for image in os.listdir(
                     os.path.join(self.parameter.FOLDER, capture_folders, scene_folder)
                 ):
-                    if not image.endswith(".png"):
+                    if not image.endswith(".png") and not image.endswith(".hdr"):
                         continue
                     key = image.split(".png")[0]
                     if key not in key_found:
@@ -186,7 +187,7 @@ class Preprocessing:
         mask[mask > 203] = 255
         cv2.imwrite(os.path.join(config.FOLDER, "mask_enhanced.png"), mask)
 
-    def hdr_fusion(self, image_file_path: str):
+    def hdr_prepare_exposure_list(self, image_file_path: str):
         image_file_name = image_file_path.split("/")[-1].split(".")[0]
         image_folder = image_file_path.split(image_file_name)[0]
         image_path_list = [
@@ -203,48 +204,54 @@ class Preprocessing:
         ]
         exposure_times = [int(x) for x in exposure_times if x.isdigit()]
         if len(exposure_times) < 4:
-            return
+            return None
         exposure_times.sort()
         image_path_list = [
-            image_file_name + "_" + str(x) + ".png" for x in exposure_times
+            os.path.join(image_folder, image_file_name + "_" + str(x) + ".png")
+            for x in exposure_times
         ]
-        exposure_times = np.array(
-            exposure_times,
-            dtype=np.float32,
+        exposure_times = (
+            np.array(
+                exposure_times,
+                dtype=np.float32,
+            )
+            / 1000000.0
         )
 
-        images = [
-            cv2.imread(
-                os.path.join(image_folder, x), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH
-            )
+        return image_path_list, exposure_times
+
+    def hdr_fusion(self, image_file_path, image_path_list, exposure_times, response):
+        image_anydepth = [
+            cv2.imread(x, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
             for x in image_path_list
         ]
         images = [
             cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            for x in images
+            for x in image_anydepth
         ]
-        calibrate = cv2.createCalibrateDebevec()
-        response = calibrate.process(images, exposure_times)
-
-        merge = cv2.createMergeDebevec()
-        hdr = merge.process(images, exposure_times, response)
+        if len(images[0].shape) == 2:
+            images = [cv2.cvtColor(x, cv2.COLOR_GRAY2BGR) for x in images]
+        hdr = self.merge.process(images, exposure_times, response)
 
         if len(hdr.shape) == 2:
             hdr = cv2.cvtColor(hdr, cv2.COLOR_GRAY2BGR)
 
-        tonemap = cv2.createTonemap(2.2)
-        ldr = tonemap.process(hdr)
+        ldr = self.tonemap.process(hdr)
 
-        mertge_mertges = cv2.createMergeMertens()
-        fusion = mertge_mertges.process(images)
+        fusion = self.mertge_mertges.process(images)
         image_file_path = image_file_path.replace(".png", "")
         cv2.imwrite(image_file_path + "_sdr.png", ldr * 255)
         cv2.imwrite(image_file_path + "_hdr.hdr", hdr)
         cv2.imwrite(image_file_path + "_fusion.png", fusion * 255)
 
+        for i in images:
+            del i
+        for i in image_anydepth:
+            del i
+
     def hdr_fusion_scene(self, scene_folder: str):
         images = os.listdir(scene_folder)
-        image_prefix = set()
+        image_prefix = {}
         for image in images:
             if not image.endswith(".png"):
                 continue
@@ -255,10 +262,9 @@ class Preprocessing:
                 continue
             if int(exposure_time) < 100:
                 continue
-            image_prefix.add(image)
+            image_prefix[image] = os.path.join(scene_folder, image)
 
-        for image in image_prefix:
-            self.hdr_fusion(os.path.join(scene_folder, image))
+        return image_prefix
 
     def listdir_space_scene(self, folder: str):
         scene_folder_list: list[str] = []
@@ -279,13 +285,82 @@ class Preprocessing:
                 )
         return scene_folder_list
 
+    def hdr_fusion_module_init(self):
+        self.merge = cv2.createMergeRobertson()
+        self.calibrate = cv2.createCalibrateRobertson()
+        self.mertge_mertges = cv2.createMergeMertens()
+        self.tonemap = cv2.createTonemap(2.2)
+
     def hdr_fusion_space(self):
+
         config = self.parameter
+        image_dict: dict[str, list[dict]] = {}
         for scene_folders in TQDM(
-            self.listdir_space_scene(config.FOLDER), desc="HDR fusion "
+            self.listdir_space_scene(config.FOLDER), desc="HDR reading datas "
         ):
 
-            self.hdr_fusion_scene(scene_folders)
+            image_prefix_dict = self.hdr_fusion_scene(scene_folders)
+            for prefix, path in image_prefix_dict.items():
+                if prefix not in image_dict:
+                    image_dict[prefix] = []
+                images, exposure_times = self.hdr_prepare_exposure_list(path)
+                image_dict[prefix].append(
+                    {
+                        "path": path,
+                        "images": images,
+                        "exposure_times": exposure_times,
+                    }
+                )
+        response: list[Optional[np.ndarray]] = [None, None]
+        for prefix, image_list in TQDM(image_dict.items(), desc="HDR fusion "):
+            channel = int(prefix.split("_")[-1])
+            print(prefix)
+            if response[channel] is None:
+                self.hdr_fusion_module_init()
+                images_all = []
+                exposures_all = []
+                for meta in image_list:
+                    images_all.extend(meta["images"])
+                    exposures_all.extend(meta["exposure_times"])
+                    if len(images_all) > 64:
+                        break
+                print(exposures_all)
+                response[channel] = self.computing_calibrate_response(
+                    images_all, exposures_all
+                )
+
+            for meta in TQDM(image_list, desc=f"HDR fusion on {prefix}"):
+                self.hdr_fusion(
+                    meta["path"],
+                    meta["images"],
+                    meta["exposure_times"],
+                    response[channel],
+                )
+
+    def computing_calibrate_response(
+        self, image_files: list[str], exposure_times: list[float]
+    ):
+        images = [
+            cv2.imread(x, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            for x in image_files
+        ]
+        images = [
+            cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            for x in images
+        ]
+
+        if len(images[0].shape) == 2:
+            images = [cv2.cvtColor(x, cv2.COLOR_GRAY2BGR) for x in images]
+
+        exposure_times = np.array(exposure_times, dtype=np.float32)
+        self.tqdm_callback("Calibrating", 0)
+        print("Calibrating")
+        response = self.calibrate.process(images, exposure_times)
+        print("Done")
+        self.tqdm_callback("Calibrating Done", 1)
+        for i in images:
+            del i
+        return response
 
     def group_images(
         self,
@@ -299,7 +374,7 @@ class Preprocessing:
             for image in os.listdir(scene_folders):
                 if not any(x in image for x in config.IMAGE_FILES):
                     continue
-                if not image.endswith(".png"):
+                if not image.endswith(".png") and not image.endswith(".hdr"):
                     continue
 
                 # Create the destination folder if it doesn't exist
@@ -316,7 +391,9 @@ class Preprocessing:
 
                 image_name = f'{scene_folders.replace("/","__")}_{image}'
                 destination_path = os.path.join(destination_folder, image_name)
-                image = cv2.imread(image_path)
+                image = cv2.imread(
+                    image_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH
+                )
 
                 if config.RGB_NIR_FUSION_ENABLED and "channel_0" in image_name:
                     image_nir = cv2.imread(image_path.replace("channel_0", "channel_1"))
