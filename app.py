@@ -7,11 +7,14 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 from ui.observable import Observable, notify_thread
 import threading
 from ui.state import RootState
+from ui.view.prefix_list_view import PrefixListView
+from colmap_wrap import ColmapWrap
 
 preprocessing: Preprocessing
+colmap: ColmapWrap
 
 
-state = RootState()
+state: RootState
 
 
 def emoji(emoji, size=32):
@@ -82,6 +85,7 @@ def ui_preprocessing_args(window: tk.Tk):
             preprocessing.parameter.__setattr__("FOLDER", value),
             state.data_examine.set_value(preprocessing.examine_folder()),
             state.image_label_list.set_value(preprocessing.parameter.IMAGE_FILES),
+            colmap.set_space_folder(value),
         ),
     )
 
@@ -93,29 +97,6 @@ def ui_preprocessing_args(window: tk.Tk):
             state.data_label_dict.set_value(value["key_found"]),
         ),
     )
-
-
-def set_list_on_select(listbox: tk.Listbox, callback: Callable):
-    def on_select(evt):
-        try:
-            w = evt.widget
-            index = int(w.curselection()[0])
-            value = w.get(index)
-            callback(value)
-        except IndexError:
-            pass
-
-    listbox.bind("<<ListboxSelect>>", on_select)
-
-
-def append_list_distinct(l: list, value):
-    if value not in l:
-        l.append(value)
-
-
-def remove_list(l: list, value):
-    if value in l:
-        l.remove(value)
 
 
 def ui_tqdm_progress(window: tk.Tk):
@@ -139,14 +120,14 @@ def ui_tqdm_progress(window: tk.Tk):
 
 
 def ui_data_examine(window: tk.Tk):
+
+    PrefixListView(window, state)
+
     label_capture_count = tk.Label(window, text="Capture Count: ")
     label_scene_count = tk.Label(window, text="Scene Count: ")
     label_capture_count.pack()
     label_scene_count.pack()
 
-    image_list_frame = tk.Frame(window)
-    image_list_frame.pack(fill="x", expand=True)
-    list_image_files = tk.Listbox(image_list_frame)
     state.data_capture_count.subscribe(
         label_capture_count,
         lambda value: label_capture_count.config(text=f"Capture Count: {value}"),
@@ -157,41 +138,6 @@ def ui_data_examine(window: tk.Tk):
         lambda value: label_scene_count.config(text=f"Scene Count: {value}"),
     )
 
-    state.data_label_dict.subscribe(
-        list_image_files,
-        lambda value: (
-            list_image_files.delete(0, tk.END),
-            list_image_files.insert(0, *value.keys()),
-        ),
-    )
-
-    set_list_on_select(
-        list_image_files,
-        lambda value: (
-            append_list_distinct(preprocessing.parameter.IMAGE_FILES, value),
-            state.image_label_list.set_value(preprocessing.parameter.IMAGE_FILES),
-        ),
-    )
-
-    list_image_files.pack(side=tk.LEFT, fill="x", expand=True)
-
-    list_image_files_process = tk.Listbox(image_list_frame)
-    state.image_label_list.subscribe(
-        list_image_files_process,
-        lambda value: (
-            list_image_files_process.delete(0, tk.END),
-            list_image_files_process.insert(0, *value),
-        ),
-    )
-    set_list_on_select(
-        list_image_files_process,
-        lambda value: (
-            remove_list(preprocessing.parameter.IMAGE_FILES, value),
-            state.image_label_list.set_value(preprocessing.parameter.IMAGE_FILES),
-        ),
-    )
-
-    list_image_files_process.pack(side=tk.LEFT, fill="x", expand=True)
     btn_frame = tk.Frame(window)
     btn_frame.pack(fill="x")
     btn_combine = tk.Button(
@@ -217,7 +163,44 @@ def ui_data_examine(window: tk.Tk):
     )
     btn_hdr_fusion.pack(side=tk.LEFT)
 
-    ui_tqdm_progress(window)
+
+def ui_colmap(window: tk.Tk):
+    frame = tk.Frame(window)
+    frame.pack(fill="x")
+
+    btn_run_all = tk.Button(
+        frame,
+        text="Colmap All",
+        command=lambda: colmap.run_fast_mapper(),
+    )
+    btn_run_all.pack(side=tk.LEFT)
+    btn_run_colmap = tk.Button(
+        frame,
+        text="Colmap FE",
+        command=lambda: colmap.run_feature_extractor(),
+    )
+    btn_run_colmap.pack(side=tk.LEFT)
+
+    btn_run_fm = tk.Button(
+        frame,
+        text="Colmap FM",
+        command=lambda: colmap.run_feature_matcher(),
+    )
+    btn_run_fm.pack(side=tk.LEFT)
+
+    btn_run_mapper = tk.Button(
+        frame,
+        text="Colmap Mapper",
+        command=lambda: colmap.run_feature_mapper(),
+    )
+    btn_run_mapper.pack(side=tk.LEFT)
+    btn_run_converter = tk.Button(
+        frame,
+        text="Colmap Converter",
+        command=lambda: colmap.run_model_convert_thread(),
+    )
+
+    btn_run_converter.pack(side=tk.LEFT)
 
 
 def main():
@@ -228,7 +211,8 @@ def main():
 
     ui_preprocessing_args(window)
     ui_data_examine(window)
-
+    ui_colmap(window)
+    ui_tqdm_progress(window)
     window.mainloop()
 
 
@@ -237,7 +221,10 @@ if __name__ == "__main__":
         None,
         lambda x, y: (state.tqdm_output.set_value(x), state.tqdm_progress.set_value(y)),
     )
-
+    state = RootState(preprocessing)
+    colmap = ColmapWrap(
+        lambda x, y: (state.tqdm_output.set_value(x), state.tqdm_progress.set_value(y)),
+    )
     thread = threading.Thread(target=notify_thread)
     thread.start()
     main()

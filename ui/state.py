@@ -1,8 +1,9 @@
 from ui.observable import Observable
+from preprocessing import Preprocessing
 
 
 class RootState:
-    def __init__(self):
+    def __init__(self, preprocessing: Preprocessing):
         self.data_folder = Observable()
 
         self.data_capture_count = Observable(0)
@@ -15,3 +16,5 @@ class RootState:
 
         self.tqdm_output = Observable("")
         self.tqdm_progress = Observable(0)
+
+        self.preprocessing = preprocessing
