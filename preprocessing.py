@@ -389,7 +389,7 @@ class Preprocessing:
                 # Copy the image file to the destination folder
                 image_path = os.path.join(scene_folders, image)
 
-                image_name = f'{scene_folders.replace("/","__")}_{image}'
+                image_name = f'{scene_folders.replace(os.path.dirname(__file__),"").replace("/","__")}_{image}'
                 destination_path = os.path.join(destination_folder, image_name)
                 image = cv2.imread(
                     image_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH
