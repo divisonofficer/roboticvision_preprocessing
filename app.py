@@ -9,6 +9,7 @@ import threading
 from ui.state import RootState
 from ui.view.prefix_list_view import PrefixListView
 from colmap_wrap import ColmapWrap
+from depth_estimation import DepthEstimation
 
 preprocessing: Preprocessing
 colmap: ColmapWrap
@@ -143,7 +144,7 @@ def ui_data_examine(window: tk.Tk):
     btn_combine = tk.Button(
         btn_frame,
         text="Combine",
-        command=lambda: preprocessing.group_images(),
+        command=lambda: preprocessing.group_images_full(),
     )
 
     btn_combine.pack(side=tk.LEFT)
@@ -156,12 +157,23 @@ def ui_data_examine(window: tk.Tk):
         thread = threading.Thread(target=hdr_fusion_thread)
         thread.start()
 
+    def depth_matching():
+        depth_estimator = DepthEstimation()
+        depth_estimator.run(state.data_folder.get_value(), tqdm_callback)
+
     btn_hdr_fusion = tk.Button(
         btn_frame,
         text="HDR Fusion",
         command=hdr_fusion,
     )
     btn_hdr_fusion.pack(side=tk.LEFT)
+
+    btn_depth_matching = tk.Button(
+        btn_frame,
+        text="Depth",
+        command=depth_matching,
+    )
+    btn_depth_matching.pack(side=tk.LEFT)
 
 
 def ui_colmap(window: tk.Tk):
@@ -216,14 +228,19 @@ def main():
     window.mainloop()
 
 
+def tqdm_callback(x, y):
+    state.tqdm_output.set_value(x)
+    state.tqdm_progress.set_value(y)
+
+
 if __name__ == "__main__":
     preprocessing = Preprocessing(
         None,
-        lambda x, y: (state.tqdm_output.set_value(x), state.tqdm_progress.set_value(y)),
+        tqdm_callback,
     )
     state = RootState(preprocessing)
     colmap = ColmapWrap(
-        lambda x, y: (state.tqdm_output.set_value(x), state.tqdm_progress.set_value(y)),
+        tqdm_callback,
     )
     thread = threading.Thread(target=notify_thread)
     thread.start()

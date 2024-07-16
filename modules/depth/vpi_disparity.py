@@ -31,7 +31,7 @@ class VPIDisparity:
                 )
         return image
 
-    def __call__(self, left: np.ndarray, right: np.ndarray):
+    def get_disparity_and_confidence(self, left: np.ndarray, right: np.ndarray):
         # pixel value scaling factor when loading input
         config = self.config
         # conftype = vpi.ConfidenceType.RELATIVE
@@ -59,20 +59,87 @@ class VPIDisparity:
                     vpi.Format.S16, backend=vpi.Backend.VIC
                 )
 
-            disparity_color = self.__apply_color_map(disparityS16, confidenceU16)
+        return disparityS16.cpu(), confidenceU16.cpu()
 
-        # self.__runtime_imshow({"disparity": disparity_color})
+    def get_disparity_multichannel(
+        self,
+        left_viz: np.ndarray,
+        right_viz: np.ndarray,
+        left_nir: np.ndarray,
+        right_nir: np.ndarray,
+    ):
+        disparityViz, confidenceViz = self.get_disparity_and_confidence(
+            left_viz, right_viz
+        )
+        disparityNir, confidenceNir = self.get_disparity_and_confidence(
+            left_nir, right_nir
+        )
+        disparityViz = disparityViz.astype(np.float32)
+        disparityNir = disparityNir.astype(np.float32)
+        confidenceViz = confidenceViz.astype(np.float32) / confidenceViz.max()
+        confidenceNir = confidenceNir.astype(np.float32) / confidenceNir.max()
+        disparityViz[disparityViz < 0] = 0
+        disparityNir[disparityNir < 0] = 0
+        disparityViz[confidenceViz < confidenceNir] = 0
+        disparityNir[confidenceNir < confidenceViz] = 0
+        disparityNir[confidenceNir < 0.8] = 0
+        disparityViz[confidenceViz < 0.8] = 0
 
-        confidence = confidenceU16.cpu()
-        confidence = confidence.astype(np.float32) / confidence.max()
-        disparity_numpy = (
-            disparityS16.cpu().astype(np.float32)
-            * 255.0
-            / (32 * self.config.maxDisparity)
+        disparity = disparityViz + disparityNir
+        disparity = disparity * 255.0 / (32 * self.config.maxDisparity)
+        disparity = disparity.astype(np.uint8)
+
+        confidence_mask = cv2.bitwise_and(
+            cv2.bitwise_and(
+                (confidenceViz < 0.8).astype(np.uint8),
+                (confidenceViz > 0).astype(np.uint8),
+            ),
+            cv2.bitwise_and(
+                (confidenceNir < 0.8).astype(np.uint8),
+                (confidenceNir > 0).astype(np.uint8),
+            ),
         )
 
+        disparity = self.__interpolation(disparity, confidence_mask)
+
+        return disparity
+
+    def __call__(self, left: np.ndarray, right: np.ndarray):
+
+        disparityS16, confidence = self.get_disparity_and_confidence(left, right)
+        # disparityColor = self.__apply_color_map(disparityS16, confidence)
+        confidence = confidence.astype(np.float32) / confidence.max()
+        disparity_numpy = (
+            disparityS16.astype(np.float32) * 255.0 / (32 * self.config.maxDisparity)
+        ).astype(np.uint8)
+
         disparity_numpy[confidence < 0.8] = 0
+        confidence_mask = (
+            cv2.bitwise_and(
+                (confidence < 0.8).astype(np.uint8),
+                (confidence > 0.00).astype(np.uint8),
+            )
+            * 255
+        )
+        disparity_numpy = self.__interpolation(disparity_numpy, confidence_mask)
+
         return disparity_numpy
+
+    def __interpolation(self, disparity, mask):
+        borderSize = 6
+        disparity = cv2.copyMakeBorder(
+            disparity,
+            borderSize,
+            borderSize,
+            borderSize,
+            borderSize,
+            cv2.BORDER_REPLICATE,
+        )  # Convert mask to uint8
+        mask = cv2.copyMakeBorder(
+            mask, borderSize, borderSize, borderSize, borderSize, cv2.BORDER_REPLICATE
+        )
+        disparity = cv2.inpaint(disparity, mask, 5, cv2.INPAINT_TELEA)
+        return disparity[borderSize:-borderSize, borderSize:-borderSize]
 
     def __stereodisp(self, left, right, confidenceU16, streamStereo):
         config = self.config
@@ -91,7 +158,7 @@ class VPIDisparity:
                 p1=4,
                 p2=128,
                 p2alpha=1,
-                uniqueness=0.99,
+                uniqueness=0.95,
                 includediagonals=config.includeDiagonals,
                 numpasses=config.numPasses,
             )

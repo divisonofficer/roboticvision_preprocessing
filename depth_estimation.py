@@ -6,6 +6,8 @@ import os
 import pandas as pd
 import open3d as o3d
 import sys
+from ui.util.tqdm_list import TQDMList
+import threading
 
 sys.path.append(
     os.path.join(
@@ -20,56 +22,15 @@ from modules.depth.sbm_cuda import SBMCuda
 from modules.depth.vpi_disparity import VPIDisparity
 from modules.depth.raft_stereo_wrapper import RaftStereoWrapper
 from modules.depth.sgbm_cuda import SGBMCuda
+from modules.stereo.camera_parameter import StereoParamterFromFile
 
 
 class Config:
     LEFT_PRIFIX = "left"
     RIGHT_PRIFIX = "right"
-    PARAMETER_FILE = "stereo_parameter.npz"
+    PARAMETER_FILE = "calibration.npz"
     FOLDER = "images"
-
-
-class CameraParameter:
-
-    def __init__(self, mtx, dist):
-        self.mtx = mtx
-        self.dist = dist
-
-
-class StereoCameraParameter:
-    def __init__(self, left: CameraParameter, right: CameraParameter, R, T):
-        self.left = left
-        self.right = right
-        self.R = R
-        self.T = T
-
-
-def StereoParamterFromFile(file: str):
-    if not file.endswith(".npz"):
-        raise ValueError("The file must be a .npz file")
-
-    data = np.load(file)
-
-    ret = data["ret"]
-    mtx_left = data["mtx_left"]
-    dist_left = data["dist_left"]
-    mtx_right = data["mtx_right"]
-    dist_right = data["dist_right"]
-    R = data["R"]
-    T = data["T"]
-    E = data["E"]
-    F = data["F"]
-    rvecs_left = data["left_rvecs"]
-    tvecs_left = data["left_tvecs"]
-    rvect_right = data["right_rvecs"]
-    tvect_right = data["right_tvecs"]
-
-    return StereoCameraParameter(
-        CameraParameter(mtx_left, dist_left),
-        CameraParameter(mtx_right, dist_right),
-        R,
-        T,
-    )
+    PREVIEW = False
 
 
 class DepthEstimation:
@@ -80,6 +41,7 @@ class DepthEstimation:
         # print(cv2.getBuildInformation())
         # self.vit = StereoTransformer()
         self.raft = RaftStereoWrapper()
+        self.tqdm = tqdm.tqdm
         pass
 
     def read_parameter(self, file: str):
@@ -131,6 +93,11 @@ class DepthEstimation:
         self.vpi = VPIDisparity(VPIDisparity.Config())
         self.stereoSGBM = SGBMCuda(SGBMCuda.Config())
 
+        GAMMA = 2.2
+        self.gamma_table = np.array(
+            [((i / 65535.0) ** (1 / GAMMA)) * 65535 for i in np.arange(65536)]
+        ).astype(np.uint16)
+
     def read_image(self, file: str):
         image = cv2.imread(file, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
         if image.dtype == np.float32:
@@ -149,24 +116,52 @@ class DepthEstimation:
 
         return normalized
 
-    def read_image_pair(self, left: str, right: str):
-        left = self.read_image(left)
-        right = self.read_image(right)
+    def read_image_pair(self, left_name: str, right_name: str):
+        left = self.read_image(left_name)
+        right = self.read_image(right_name)
         # left = self.normalize_image(left)
         # right = self.normalize_image(right)
 
         left = cv2.remap(left, self.map_left_x, self.map_left_y, cv2.INTER_LINEAR)
         right = cv2.remap(right, self.map_right_x, self.map_right_y, cv2.INTER_LINEAR)
 
-        return left, right
+        max_intensity = left.max()
+        if max_intensity < right.max():
+            max_intensity = right.max()
+        print(left.shape, left.dtype, left.min(), left.max(), max_intensity)
+
+        left = (left / max_intensity * 65535).astype(np.uint16)
+        right = (right / max_intensity * 65535).astype(np.uint16)
+
+        # for i in range(left.shape[0]):
+        #     for j in range(left.shape[1]):
+        #         if len(left.shape) == 2:
+        #             left[i, j] = self.gamma_table[int(left[i, j])]
+        #             right[i, j] = self.gamma_table[int(right[i, j])]
+        #         else:
+        #             for k in range(3):
+        #                 left[i, j, k] = self.gamma_table[int(left[i, j, k])]
+        #                 right[i, j, k] = self.gamma_table[int(right[i, j, k])]
+
+        rect_folder_name = "/".join(left_name.split("/")[:-2]) + "/rect"
+        os.makedirs(rect_folder_name, exist_ok=True)
+        left_name = rect_folder_name + "/" + left_name.split("/")[-1] + ".png"
+        right_name = rect_folder_name + "/" + right_name.split("/")[-1] + ".png"
+        # print(left_name, right_name)
+
+        scale = 65535 / max_intensity
+        cv2.imwrite(
+            left_name,
+            left,
+        )
+        cv2.imwrite(
+            right_name,
+            right,
+        )
+        print("imwrite")
+        return left.astype(np.float32), right.astype(np.float32)
 
     def compute_depth_from_disparity(self, disparity_map):
-        print(
-            "Disparity",
-            disparity_map.min(),
-            disparity_map.max(),
-            np.median(disparity_map),
-        )
         baseline = np.linalg.norm(self.stereo_param.T)
         fx = self.stereo_param.left.mtx[0, 0]
         depth = (
@@ -211,6 +206,7 @@ class DepthEstimation:
         return disparity
 
     def process_pair(self, left: str, right: str, model=None, use_gray=False):
+
         left, right = self.read_image_pair(left, right)
         if use_gray:
             left = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
@@ -222,12 +218,29 @@ class DepthEstimation:
 
         return disparity_map, depth
 
+    def process_pair_multichannel(self, left: str, right: str, model=None):
+        left_viz = left.replace("channel_1", "channel_0")
+        right_viz = right.replace("channel_1", "channel_0")
+        left_nir = left.replace("channel_0", "channel_1")
+        right_nir = right.replace("channel_0", "channel_1")
+        left_viz, right_viz = self.read_image_pair(left_viz, right_viz)
+        left_nir, right_nir = self.read_image_pair(left_nir, right_nir)
+        left_viz = cv2.cvtColor(left_viz, cv2.COLOR_BGR2GRAY)
+        right_viz = cv2.cvtColor(right_viz, cv2.COLOR_BGR2GRAY)
+        left_nir = cv2.cvtColor(left_nir, cv2.COLOR_BGR2GRAY)
+        right_nir = cv2.cvtColor(right_nir, cv2.COLOR_BGR2GRAY)
+        disparity_map = self.vpi.get_disparity_multichannel(
+            left_viz, right_viz, left_nir, right_nir
+        )
+        depth = self.compute_depth_from_disparity(disparity_map)
+        return disparity_map, depth
+
     def process_grouped_folder(self, folder: str):
         """
         folder/image_left/image_left.hdr ...
         """
 
-        root_folder = os.path.join(folder, "images_origin")
+        root_folder = os.path.join(folder, "images_hdr")
         sub_folders = [
             x
             for x in os.listdir(root_folder)
@@ -240,34 +253,49 @@ class DepthEstimation:
         images_right = os.listdir(os.path.join(root_folder, sub_folder_right))
         images_left.sort()
         images_right.sort()
-        image_pairs = zip(images_left, images_right)
+        image_pairs = list(zip(images_left, images_right))
 
         os.makedirs(os.path.join(root_folder, "depth"), exist_ok=True)
         os.makedirs(os.path.join(root_folder, "point_cloud"), exist_ok=True)
 
-        for i, (left, right) in enumerate(tqdm.tqdm(image_pairs)):
+        for i, (left, right) in enumerate(self.tqdm(image_pairs)):
+
             left_p = os.path.join(root_folder, sub_folder_left, left)
             right_p = os.path.join(root_folder, sub_folder_right, right)
 
             models = [
-                # ("RAFT", self.raft, False),
-                # ("SBM", self.stereoBM, True),
-                # ("SGBM", self.stereoSGBM, True),
+                ("RAFT", self.raft, False, False),
+                # ("SBM", self.stereoBM, True, False),
+                # ("SGBM", self.stereoSGBM, True, False),
                 # (
                 #     "SBM_256",
                 #     lambda x, y: self.process_SBM_cuda_bitswift(x, y, 256),
                 #     True,
                 # ),
                 # ("SBM_1", lambda x, y: self.process_SBM_cuda_bitswift(x, y, 1), True),
-                ("VPI", self.vpi, True),
+                # ("VPI", self.vpi, True, False),
+                # (
+                #     "VPI_MULTICHANNEL",
+                #     lambda x, y: self.process_pair_multichannel(x, y, None),
+                #     True,
+                #     True,
+                # ),
             ]
 
-            for name, model, use_gray in models:
-                disparity, depth = self.process_pair(left_p, right_p, model, use_gray)
+            for name, model, use_gray, custom_loader in models:
+                if custom_loader:
+                    disparity, depth = model(left_p, right_p)
+                else:
+                    disparity, depth = self.process_pair(
+                        left_p, right_p, model, use_gray
+                    )
+                channel_name = left.split("channel_")[1].split("_")[0]
                 output_path = os.path.join(
-                    root_folder,
+                    root_folder.replace("images_origin", "output"),
                     "depth",
-                    left.replace(Config.LEFT_PRIFIX, f"_{name}_depth_"),
+                    left.replace(
+                        Config.LEFT_PRIFIX, f"_c_{channel_name}_{name}_depth_"
+                    ),
                 )
 
                 cv2.imwrite(
@@ -285,9 +313,7 @@ class DepthEstimation:
                 disparity[disparity < 0] = 0
 
                 disparity_color = cv2.applyColorMap(
-                    cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX).astype(
-                        np.uint8
-                    ),
+                    np.clip(disparity, 0, 255).astype(np.uint8),
                     cv2.COLORMAP_JET,
                 )
 
@@ -304,10 +330,9 @@ class DepthEstimation:
                     self.read_image(left_p), depth
                 )
                 # self.show_point_cloud(points, color)
-
-                cv2.imshow(f"{name}_depth", depth_color)
-                cv2.imshow(f"{name}_disparity", disparity_color)
-
+                if Config.PREVIEW:
+                    cv2.imshow(f"{name}_depth", depth_color)
+                    cv2.imshow(f"{name}_disparity", disparity_color)
                 point_cloud = o3d.geometry.PointCloud()
                 point_cloud.points = o3d.utility.Vector3dVector(points)
                 color[color > color.mean() * 3] = color.mean() * 3
@@ -317,8 +342,8 @@ class DepthEstimation:
                     f"{output_path.split('.')[0].replace('depth','point_cloud')}_{name}_point_cloud.ply",
                     point_cloud,
                 )
-
-            cv2.waitKey(0)
+            if Config.PREVIEW:
+                cv2.waitKey(0)
 
     def generate_point_cloud(self, left_image, depth_image):
         xx, yy = np.meshgrid(
@@ -343,8 +368,7 @@ class DepthEstimation:
 
         points = point_grid.transpose(1, 2, 0)[mask]
         colors = left_image[mask].astype(np.float64)
-        print(colors.min(), colors.max(), colors.mean())
-        print("Point Cloud Generated : ", points.shape, colors.shape)
+
         return points, colors
         # points_with_color = np.concatenate((points, colors), axis=1)
 
@@ -373,15 +397,32 @@ class DepthEstimation:
         ]
         files_left.sort()
         files_right.sort()
-        file_pairs = zip(files_left, files_right)
+        file_pairs = list(zip(files_left, files_right))
 
-        for left, right in tqdm.tqdm(file_pairs):
+        for left, right in self.tqdm(file_pairs):
             depth = self.process_pair(left, right)
             depth[depth == np.inf] = 0
             depth[depth < 0] = 0
 
             depth = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
             cv2.imwrite(os.path.join(folder, "depth_" + left + ".png"), depth)
+
+    def run(self, folder: str, tqdm_callback):
+        self.read_parameter(Config.PARAMETER_FILE)
+        self.init_merge()
+        Config.PREVIEW = False
+        Config.FOLDER = folder
+        self.tqdm = lambda x, desc=None: TQDMList(x, desc, tqdm_callback)
+
+        def threaded():
+            Config.LEFT_PRIFIX = "left_channel_0_hdr"
+            Config.RIGHT_PRIFIX = "right_channel_0_hdr"
+            self.process_grouped_folder(folder)
+            Config.LEFT_PRIFIX = "left_channel_1_hdr"
+            Config.RIGHT_PRIFIX = "right_channel_1_hdr"
+            self.process_grouped_folder(folder)
+
+        threading.Thread(target=threaded).start()
 
 
 def parseArgs():
@@ -410,14 +451,18 @@ def parseArgs():
     parser.add_argument(
         "--prefix_left",
         type=str,
-        default="left",
+        default="left_channel_0_hdr",
         help="The prefix for the left camera images",
     )
     parser.add_argument(
         "--prefix_right",
         type=str,
-        default="right",
+        default="right_channel_0_hdr",
         help="The prefix for the right camera images",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
     )
     return parser.parse_args()
 
@@ -430,6 +475,7 @@ if __name__ == "__main__":
     Config.FOLDER = args.folder
     Config.LEFT_PRIFIX = args.prefix_left
     Config.RIGHT_PRIFIX = args.prefix_right
+    Config.PREVIEW = args.preview
 
     depth_estimation.init_merge()
     if args.use_grouped:

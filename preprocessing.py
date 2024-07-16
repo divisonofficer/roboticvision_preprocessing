@@ -5,6 +5,7 @@ import numpy as np
 from fusion import fusion
 import argparse
 from typing import Optional, Callable
+from ui.util.tqdm_list import TQDMList
 
 
 _IMAGE_FILES = [
@@ -18,22 +19,6 @@ _IMAGE_FILES = [
 ]
 
 TQDM = tqdm
-
-
-class TQDMList:
-    def __init__(self, data: list, prefix: Optional[str], callback: Callable):
-        self.data = data
-        self.callback = callback
-        if prefix is None:
-            self.prefix = ""
-        else:
-            self.prefix = prefix
-
-    def __iter__(self):
-        for idx, item in enumerate(self.data):
-            yield item
-            self.callback(f"{self.prefix}{idx}/{len(self.data)}", idx / len(self.data))
-        self.callback(f"{self.prefix}{len(self.data)}/{len(self.data)}", 1)
 
 
 def parse_args():
@@ -225,6 +210,9 @@ class Preprocessing:
             cv2.imread(x, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
             for x in image_path_list
         ]
+        if any(x is None for x in image_anydepth):
+            return
+
         images = [
             cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             for x in image_anydepth
@@ -361,6 +349,29 @@ class Preprocessing:
         for i in images:
             del i
         return response
+
+    def group_images_full(self):
+        config = self.parameter
+        old_dest = config.DEST_FOLDER
+        old_images = config.IMAGE_FILES
+        config.DEST_FOLDER = "images_origin"
+        config.IMAGE_FILES = [
+            "jai_1600_left_channel_0_fusion.png",
+            "jai_1600_left_channel_1_fusion.png",
+            "jai_1600_right_channel_0_fusion.png",
+            "jai_1600_right_channel_1_fusion.png",
+        ]
+        self.group_images()
+        config.DEST_FOLDER = "images_hdr"
+        config.IMAGE_FILES = [
+            "jai_1600_left_channel_0_hdr.hdr",
+            "jai_1600_left_channel_1_hdr.hdr",
+            "jai_1600_right_channel_0_hdr.hdr",
+            "jai_1600_right_channel_1_hdr.hdr",
+        ]
+        self.group_images()
+        config.DEST_FOLDER = old_dest
+        config.IMAGE_FILES = old_images
 
     def group_images(
         self,

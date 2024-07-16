@@ -66,15 +66,19 @@ class ColmapWrap:
             f"<{len(self.camera_params[1])}d", *self.camera_params[1]
         )
 
-        for camera_id in cameras:
+        print(self.camera_params)
 
+        for camera_id in cameras:
+            print(camera_id[0], camera_id[0] % 2)
             if camera_id[0] % 2 == 1:
                 cursor.execute(
-                    "UPDATE cameras SET params = ?", (param_left_byte_encoded,)
+                    "UPDATE cameras SET params = ? WHERE camera_id = ?",
+                    (param_left_byte_encoded, camera_id[0]),
                 )
             else:
                 cursor.execute(
-                    "UPDATE cameras SET params = ?", (param_right_byte_encoded,)
+                    "UPDATE cameras SET params = ? WHERE camera_id = ?",
+                    (param_right_byte_encoded, camera_id[0]),
                 )
         sql.commit()
 
@@ -93,8 +97,10 @@ class ColmapWrap:
                 )
                 progress_str = [x.split("/") for x in progress_str]
                 total = int(progress_str[1][1]) ** 2
-                progress = int(progress_str[0][0]) * int(progress_str[1][1]) + int(
-                    progress_str[1][0]
+                progress = (
+                    (int(progress_str[0][0]) - 1) * int(progress_str[1][1])
+                    + int(progress_str[1][0])
+                    - 1
                 )
                 self.tqdm_callback(
                     f"Feature Match {progress}/{total}", float(progress) / float(total)
